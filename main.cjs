@@ -58,6 +58,7 @@ let pollTimer = null;
 const apps = loadApps();
 const status = {};    // appId -> 'online' | 'stopped' | 'starting' | 'unknown'
 const prevStatus = {}; // appId -> previous value — used for crash detection
+const monit = {};     // appId -> { cpu: number, memory: number } | null
 
 // ---------------------------------------------------------------------------
 // PM2 helpers
@@ -102,6 +103,14 @@ function isOnline(list, pm2Names) {
     const proc = list.find((p) => p.name === name);
     return proc && proc.pm2_env?.status === 'online';
   });
+}
+
+function getMonit(list, pm2Names) {
+  const procs = pm2Names.map((name) => list.find((p) => p.name === name)).filter(Boolean);
+  if (!procs.length) return null;
+  const cpu = procs.reduce((s, p) => s + (p.monit?.cpu ?? 0), 0);
+  const memory = procs.reduce((s, p) => s + (p.monit?.memory ?? 0), 0);
+  return { cpu, memory };
 }
 
 // ---------------------------------------------------------------------------
@@ -153,6 +162,15 @@ async function openApp(appDef) {
 async function stopApp(appDef) {
   await pm2Stop(appDef.pm2Names);
   await refreshStatus();
+}
+
+function openLogs(appDef) {
+  const name = appDef.pm2Names[0];
+  if (process.platform === 'darwin') {
+    exec(`osascript -e 'tell application "Terminal" to do script "pm2 logs ${name}"'`);
+  } else {
+    exec(`start cmd /k "pm2 logs ${name}"`, { shell: true });
+  }
 }
 
 async function restartApp(appDef) {
@@ -213,6 +231,7 @@ async function refreshStatus() {
 
     prevStatus[a.id] = status[a.id];
     status[a.id] = next;
+    monit[a.id] = next === 'online' ? getMonit(list, a.pm2Names) : null;
   }
   rebuildMenu();
 }
@@ -241,13 +260,20 @@ function rebuildMenu(pm2Missing = false) {
       const dot = DOT[s];
       const label = starting ? `🟡 ${a.name} — starting…` : `${dot} ${a.name}`;
 
+      const m = monit[a.id];
+      const resourceLabel = m
+        ? `CPU: ${m.cpu.toFixed(1)}%  RAM: ${(m.memory / 1024 / 1024).toFixed(0)} MB`
+        : null;
+
       return {
         label,
         submenu: [
           { label: 'Open', click: () => openApp(a) },
           { label: 'Restart', enabled: online, click: () => restartApp(a) },
+          { label: 'View Logs', click: () => openLogs(a) },
           { type: 'separator' },
           { label: 'Stop', enabled: online, click: () => stopApp(a) },
+          ...(resourceLabel ? [{ type: 'separator' }, { label: resourceLabel, enabled: false }] : []),
         ],
       };
     });
