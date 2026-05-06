@@ -4,16 +4,14 @@
  * Studio Launcher — tray-only Electron app.
  *
  * No BrowserWindow. No native modules. No ABI concerns.
- * Does exactly three things:
- *   1. Shows a system tray icon with per-app status
- *   2. Starts apps via PM2 on demand
- *   3. Opens apps in the system browser
+ * Features: per-app submenu (Open/Restart/Stop), crash notifications,
+ * Start All / Stop All, 10s status polling, PM2-not-found guard.
  */
 
-const { app, Tray, Menu, nativeImage, shell } = require('electron');
+const { app, Tray, Menu, nativeImage, shell, Notification } = require('electron');
 const { exec } = require('child_process');
 const { existsSync, readFileSync } = require('fs');
-const { join, resolve } = require('path');
+const { join } = require('path');
 const { homedir } = require('os');
 
 // ---------------------------------------------------------------------------
@@ -29,7 +27,6 @@ function loadApps() {
   const localPath = join(__dirname, 'apps.local.json');
   if (existsSync(localPath)) {
     const local = JSON.parse(readFileSync(localPath, 'utf8'));
-    // local.apps entries override by id
     if (local.apps) {
       for (const localApp of local.apps) {
         const idx = base.apps.findIndex((a) => a.id === localApp.id);
@@ -38,7 +35,6 @@ function loadApps() {
       }
     }
   }
-  // Expand ~ in ecosystemPath
   return base.apps.map((a) => ({ ...a, ecosystemPath: expandHome(a.ecosystemPath) }));
 }
 
@@ -51,14 +47,17 @@ if (!app.requestSingleInstanceLock()) {
   process.exit(0);
 }
 
+app.on('second-instance', () => { /* focus would go here if we had a window */ });
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
 
 let tray = null;
 let pollTimer = null;
-const status = {}; // appId -> 'online' | 'stopped' | 'starting' | 'unknown'
 const apps = loadApps();
+const status = {};    // appId -> 'online' | 'stopped' | 'starting' | 'unknown'
+const prevStatus = {}; // appId -> previous value — used for crash detection
 
 // ---------------------------------------------------------------------------
 // PM2 helpers
@@ -83,6 +82,18 @@ function pm2Start(ecosystemPath, pm2Names) {
   return new Promise((resolve) => {
     const onlyFlag = pm2Names.map((n) => `--only ${n}`).join(' ');
     exec(`pm2 start "${ecosystemPath}" ${onlyFlag}`, resolve);
+  });
+}
+
+function pm2Stop(pm2Names) {
+  return new Promise((resolve) => {
+    exec(`pm2 stop ${pm2Names.join(' ')}`, resolve);
+  });
+}
+
+function pm2Restart(pm2Names) {
+  return new Promise((resolve) => {
+    exec(`pm2 restart ${pm2Names.join(' ')}`, resolve);
   });
 }
 
@@ -114,32 +125,68 @@ function waitForHealth(healthUrl, timeout = 30_000) {
 }
 
 // ---------------------------------------------------------------------------
-// Open an app — start if needed, then open browser
+// App actions
 // ---------------------------------------------------------------------------
 
-async function openApp(appDef) {
-  const names = appDef.pm2Names;
-  const list = await pm2List();
-
-  if (isOnline(list, names)) {
-    shell.openExternal(appDef.url);
-    return;
-  }
-
-  // Mark as starting so the menu reflects it
+async function startApp(appDef) {
+  if (status[appDef.id] === 'starting') return;
   status[appDef.id] = 'starting';
   rebuildMenu();
 
-  if (!existsSync(appDef.ecosystemPath)) {
-    // Fallback: just open the URL and hope for the best
+  if (existsSync(appDef.ecosystemPath)) {
+    await pm2Start(appDef.ecosystemPath, appDef.pm2Names);
+    await waitForHealth(appDef.healthUrl);
+  }
+  await refreshStatus();
+}
+
+async function openApp(appDef) {
+  const list = await pm2List();
+  if (isOnline(list, appDef.pm2Names)) {
     shell.openExternal(appDef.url);
     return;
   }
-
-  await pm2Start(appDef.ecosystemPath, names);
-  await waitForHealth(appDef.healthUrl);
+  await startApp(appDef);
   shell.openExternal(appDef.url);
+}
+
+async function stopApp(appDef) {
+  await pm2Stop(appDef.pm2Names);
   await refreshStatus();
+}
+
+async function restartApp(appDef) {
+  status[appDef.id] = 'starting';
+  rebuildMenu();
+  await pm2Restart(appDef.pm2Names);
+  await waitForHealth(appDef.healthUrl);
+  await refreshStatus();
+}
+
+async function startAll() {
+  const list = await pm2List();
+  const stopped = apps.filter((a) => !isOnline(list, a.pm2Names));
+  await Promise.all(stopped.map((a) => startApp(a)));
+}
+
+async function stopAll() {
+  await Promise.all(apps.map((a) => pm2Stop(a.pm2Names)));
+  await refreshStatus();
+}
+
+// ---------------------------------------------------------------------------
+// Crash notifications
+// ---------------------------------------------------------------------------
+
+function notifyCrash(appDef) {
+  if (!Notification.isSupported()) return;
+  const n = new Notification({
+    title: `${appDef.name} went offline`,
+    body: 'Click the tray icon to restart.',
+    silent: false,
+  });
+  n.on('click', () => openApp(appDef));
+  n.show();
 }
 
 // ---------------------------------------------------------------------------
@@ -156,8 +203,16 @@ async function refreshStatus() {
 
   const list = await pm2List();
   for (const a of apps) {
-    if (status[a.id] === 'starting') continue; // don't overwrite mid-start
-    status[a.id] = isOnline(list, a.pm2Names) ? 'online' : 'stopped';
+    if (status[a.id] === 'starting') continue;
+    const next = isOnline(list, a.pm2Names) ? 'online' : 'stopped';
+
+    // Crash detection: was running, now stopped
+    if (prevStatus[a.id] === 'online' && next === 'stopped') {
+      notifyCrash(a);
+    }
+
+    prevStatus[a.id] = status[a.id];
+    status[a.id] = next;
   }
   rebuildMenu();
 }
@@ -180,16 +235,32 @@ function rebuildMenu(pm2Missing = false) {
     ];
   } else {
     items = apps.map((a) => {
-      const dot = DOT[status[a.id] ?? 'unknown'];
-      const label = status[a.id] === 'starting'
-        ? `🟡 ${a.name} — starting…`
-        : `${dot} ${a.name}`;
-      return { label, click: () => openApp(a) };
+      const s = status[a.id] ?? 'unknown';
+      const online = s === 'online';
+      const starting = s === 'starting';
+      const dot = DOT[s];
+      const label = starting ? `🟡 ${a.name} — starting…` : `${dot} ${a.name}`;
+
+      return {
+        label,
+        submenu: [
+          { label: 'Open', click: () => openApp(a) },
+          { label: 'Restart', enabled: online, click: () => restartApp(a) },
+          { type: 'separator' },
+          { label: 'Stop', enabled: online, click: () => stopApp(a) },
+        ],
+      };
     });
   }
 
+  const anyOnline = apps.some((a) => status[a.id] === 'online');
+  const anyStopped = apps.some((a) => status[a.id] === 'stopped');
+
   const menu = Menu.buildFromTemplate([
     ...items,
+    { type: 'separator' },
+    { label: 'Start All', enabled: anyStopped, click: startAll },
+    { label: 'Stop All', enabled: anyOnline, click: stopAll },
     { type: 'separator' },
     { label: 'Quit Launcher', click: () => { clearInterval(pollTimer); app.quit(); } },
   ]);
@@ -213,24 +284,18 @@ function getTrayIcon() {
 // ---------------------------------------------------------------------------
 
 app.whenReady().then(async () => {
-  // No dock icon on macOS — this is a tray-only app
   app.dock?.hide();
-
-  // Register as a login item so the launcher starts with the OS
   app.setLoginItemSettings({ openAtLogin: true });
 
   tray = new Tray(getTrayIcon());
   tray.setToolTip('Studio Launcher');
 
-  // macOS: left-click shows the context menu (default is right-click only)
   if (process.platform === 'darwin') {
     tray.on('click', () => tray.popUpContextMenu());
   }
 
-  // Initial status + start polling
   await refreshStatus();
   pollTimer = setInterval(refreshStatus, 10_000);
 });
 
-// Keep the process alive even with no windows open
 app.on('window-all-closed', () => {});
