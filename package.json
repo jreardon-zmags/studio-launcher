@@ -1,0 +1,38 @@
+{
+  "name": "studio-launcher",
+  "version": "1.0.0",
+  "description": "System tray launcher for studio web apps (Pulse, Mr Manager, and more)",
+  "main": "main.cjs",
+  "type": "commonjs",
+  "scripts": {
+    "start": "electron .",
+    "icons": "node scripts/create-icons.js",
+    "build:mac": "electron-builder --mac --universal",
+    "build:win": "electron-builder --win"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^26.0.0"
+  },
+  "build": {
+    "appId": "com.zmags.studio-launcher",
+    "productName": "Studio Launcher",
+    "icon": "assets/icon",
+    "directories": { "output": "dist" },
+    "files": ["main.cjs", "apps.json", "assets/**", "package.json"],
+    "mac": {
+      "target": [{ "target": "dmg", "arch": ["universal"] }],
+      "identity": null,
+      "category": "public.app-category.utilities"
+    },
+    "win": {
+      "target": ["nsis"]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": false,
+      "createStartMenuShortcut": true
+    }
+  }
+}
